@@ -1,0 +1,6 @@
+北 B-LOC
+京 I-LOC
+位 O
+于 O
+中 B-LOC
+国 I-LOC

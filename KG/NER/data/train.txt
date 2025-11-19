@@ -1,0 +1,15 @@
+中 B-LOC
+国 I-LOC
+位 O
+于 O
+亚 B-LOC
+洲 I-LOC
+
+北 B-LOC
+京 I-LOC
+是 O
+中 B-LOC
+国 I-LOC
+的 O
+首 O
+都 O

@@ -1,0 +1,7 @@
+上 B-LOC
+海 I-LOC
+在 O
+中 B-LOC
+国 I-LOC
+东 B-LOC
+部 I-LOC

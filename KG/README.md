@@ -1,0 +1,14 @@
+1. 绝对统治地位：BERT (RoBERTa/MacBERT) + 下游层
+这是目前的工业界“黄金标准”。
+预训练模型底座：通常使用 RoBERTa-wwm-ext 或 MacBERT（哈工大讯飞联合实验室出品）。这些模型在中文任务上比原始 Google BERT 强很多。
+解码层变化：
+BERT + CRF：最经典的组合。虽然 CRF（条件随机场）解码速度稍慢，但能保证标签的合法性（不会出现 O 后面接 I 的情况）。
+BERT + Softmax/Span：为了追求极致速度，很多场景直接去掉 CRF，改用简单的分类或 Span 指针网络。
+
+
+
+Schema
+
+定义schema
+专业、课程、知识点；
+岗位、技能、行业、职责。
