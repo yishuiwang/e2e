@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Project specific
+KG/NER/data/EduNER/
+KG/NER/models/
+KG/NER/outputs/
+KG/NER/data/ResumesJsonAnnotated/
+KG/NER/data/ResumesJsonAnnotated.zip
+KG/NER/data/courses.json
+
+DB/*.xlsx
+DB/*.csv
+
+
+# Large files
+*.zip
+*.tar.gz
+*.rar
+

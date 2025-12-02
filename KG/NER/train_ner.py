@@ -1,165 +1,262 @@
+"""
+训练脚本
+"""
+import os
+import random
+import numpy as np
 import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torch.optim import AdamW
+from transformers import BertTokenizer, get_linear_schedule_with_warmup
+from tqdm import tqdm
 from pathlib import Path
-from typing import List, Dict
-from datasets import load_dataset
-from torch.utils.data import DataLoader, Dataset
-from transformers import AutoTokenizer, get_linear_schedule_with_warmup
-from seqeval.metrics import classification_report
-from model import BERTBiLSTMCRF
 
-MODEL_ID = "hfl/chinese-roberta-wwm-ext"
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from config import Config
+from dataset import NERDataset, collate_fn
+from model import BertBiLSTMCRF
+from seqeval.metrics import f1_score, precision_score, recall_score, classification_report
 
 
-class HFNERDataset(Dataset):
-    def __init__(self, records: List[Dict], label_list: List[str], tokenizer_name: str, max_length: int = 256):
-        self.records = records
-        self.label_list = label_list
-        self.label2id = {l: i for i, l in enumerate(label_list)}
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
-        self.max_length = max_length
-
-    def __len__(self):
-        return len(self.records)
-
-    def __getitem__(self, idx):
-        return self.records[idx]
-
-    def collate_fn(self, batch: List[Dict]):
-        # Expect each record to have tokens list and tags list; attempt to auto-detect keys.
-        sample = batch[0]
-        tokens_key = None
-        labels_key = None
-        for k in sample.keys():
-            if isinstance(sample[k], list):
-                if all(isinstance(x, str) for x in sample[k]):
-                    if tokens_key is None:
-                        tokens_key = k
-                if all(isinstance(x, str) for x in sample[k]):
-                    # heuristic: if key name contains 'label' or 'tag'
-                    if 'label' in k.lower() or 'tag' in k.lower():
-                        labels_key = k
-        # fallback common names
-        if tokens_key is None:
-            tokens_key = 'tokens'
-        if labels_key is None:
-            labels_key = 'ner_tags' if 'ner_tags' in sample else 'labels'
-
-        texts = ["".join(item[tokens_key]) for item in batch]
-        encodings = self.tokenizer(texts, return_tensors='pt', padding=True, truncation=True, max_length=self.max_length)
-        labels_batch = []
-        for item, input_ids, attention_mask in zip(batch, encodings['input_ids'], encodings['attention_mask']):
-            word_tokens = item[tokens_key]
-            word_labels = item[labels_key]
-            # Align char-level labels with tokens produced.
-            tokens = self.tokenizer.convert_ids_to_tokens(input_ids.tolist())
-            labels = []
-            idx_word = 0
-            for tok in tokens:
-                if tok in (self.tokenizer.cls_token, self.tokenizer.sep_token) or tok.startswith('[PAD]'):
-                    labels.append(-100)
-                else:
-                    if idx_word < len(word_labels):
-                        labels.append(self.label2id.get(word_labels[idx_word], -100))
-                        idx_word += 1
-                    else:
-                        labels.append(-100)
-            labels_batch.append(labels)
-        labels_tensor = torch.tensor(labels_batch, dtype=torch.long)
-        return {
-            'input_ids': encodings['input_ids'],
-            'attention_mask': encodings['attention_mask'],
-            'labels': labels_tensor
-        }
+def set_seed(seed):
+    """设置随机种子"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
-def load_hf_dataset(name: str = "ttxy/cn_ner"):
-    ds = load_dataset(name)
-    # Determine splits
-    train_split = ds['train']
-    dev_split = ds['validation'] if 'validation' in ds else ds.get('dev', ds['train'])
-    test_split = ds.get('test', None)
-    # Infer label list from a feature (try typical keys)
-    candidate_keys = ['ner_tags', 'labels', 'tags']
-    label_list = None
-    for key in candidate_keys:
-        if key in train_split.features:
-            feat = train_split.features[key]
-            if hasattr(feat, 'names'):
-                label_list = feat.names
-                break
-    if label_list is None:
-        # Fallback: collect unique labels from a sample subset
-        label_set = set()
-        for ex in train_split.select(range(min(100, len(train_split)))):
-            for k in candidate_keys:
-                if k in ex:
-                    label_set.update(ex[k])
-        label_list = sorted(label_set)
-    return train_split, dev_split, test_split, label_list
-
-
-def evaluate(model, loader, id2label):
+def evaluate(model, dataloader, device, id2tag):
+    """
+    评估模型
+    
+    Returns:
+        metrics: 包含precision, recall, f1的字典
+    """
     model.eval()
-    true_tags, pred_tags = [], []
+    
+    all_preds = []
+    all_labels = []
+    
     with torch.no_grad():
-        for batch in loader:
-            input_ids = batch['input_ids'].to(DEVICE)
-            attention_mask = batch['attention_mask'].to(DEVICE)
-            labels = batch['labels'].to(DEVICE)
-            paths = model(input_ids, attention_mask, labels=None)
-            for path, gold, mask in zip(paths, labels, attention_mask):
-                seq_len = int(mask.sum().item())
-                gold_seq = [id2label[int(t.item())] for t in gold[:seq_len] if int(t.item()) != -100]
-                pred_seq = [id2label[tag] for tag in path[:len(gold_seq)]]
-                true_tags.append(gold_seq)
-                pred_tags.append(pred_seq)
-    print(classification_report(true_tags, pred_tags))
-    model.train()
+        for batch in tqdm(dataloader, desc="Evaluating"):
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            token_type_ids = batch['token_type_ids'].to(device)
+            labels = batch['labels'].to(device)
+            
+            # 预测
+            predictions = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids
+            )
+            
+            # 处理预测结果和标签
+            for pred, label, mask in zip(predictions, labels, attention_mask):
+                # pred是list，label是tensor
+                pred_tags = []
+                true_tags = []
+                
+                for p, l, m in zip(pred, label.cpu().numpy(), mask.cpu().numpy()):
+                    if m == 1:  # 只考虑非padding的部分
+                        pred_tag = id2tag.get(p, 'O')
+                        true_tag = id2tag.get(l, 'O')
+                        
+                        # 忽略PAD标签
+                        if true_tag != 'PAD':
+                            pred_tags.append(pred_tag)
+                            true_tags.append(true_tag)
+                
+                if pred_tags and true_tags:
+                    all_preds.append(pred_tags)
+                    all_labels.append(true_tags)
+    
+    # 计算metrics (使用seqeval)
+    precision = precision_score(all_labels, all_preds)
+    recall = recall_score(all_labels, all_preds)
+    f1 = f1_score(all_labels, all_preds)
+    
+    # 打印详细报告
+    print("\n" + classification_report(all_labels, all_preds, digits=4))
+    
+    return {
+        'precision': precision,
+        'recall': recall,
+        'f1': f1
+    }
 
 
-def train(epochs: int = 3, batch_size: int = 8, lr: float = 3e-5):
-    print("加载数据集 ttxy/cn_ner ...")
-    train_split, dev_split, test_split, label_list = load_hf_dataset("ttxy/cn_ner")
-    print(f"标签集合: {label_list}")
-
-    # Convert HF dataset to list-of-dict for our Dataset wrapper
-    train_records = [train_split[i] for i in range(len(train_split))]
-    dev_records = [dev_split[i] for i in range(len(dev_split))]
-
-    train_ds = HFNERDataset(train_records, label_list, MODEL_ID)
-    dev_ds = HFNERDataset(dev_records, label_list, MODEL_ID)
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=train_ds.collate_fn)
-    dev_loader = DataLoader(dev_ds, batch_size=batch_size, shuffle=False, collate_fn=dev_ds.collate_fn)
-
-    model = BERTBiLSTMCRF(MODEL_ID, num_tags=len(label_list)).to(DEVICE)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    total_steps = epochs * len(train_loader)
-    scheduler = get_linear_schedule_with_warmup(optimizer, int(0.1 * total_steps), total_steps)
-
-    for epoch in range(1, epochs + 1):
+def train():
+    """训练主函数"""
+    
+    # 配置
+    config = Config()
+    
+    # 设置随机种子
+    set_seed(config.seed)
+    
+    # 创建输出目录
+    output_dir = Path(config.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 设置设备
+    device = torch.device(config.device if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # 加载tokenizer
+    print(f"\nLoading tokenizer from {config.pretrained_model}...")
+    tokenizer = BertTokenizer.from_pretrained(config.pretrained_model)
+    
+    # 加载数据集
+    print("\nLoading datasets...")
+    train_dataset = NERDataset(config.train_file, tokenizer, config)
+    dev_dataset = NERDataset(config.dev_file, tokenizer, config)
+    
+    # 创建DataLoader
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        collate_fn=collate_fn
+    )
+    
+    dev_dataloader = DataLoader(
+        dev_dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        collate_fn=collate_fn
+    )
+    
+    # 初始化模型
+    print("\nInitializing model...")
+    from transformers import BertConfig as BertModelConfig
+    bert_config = BertModelConfig.from_pretrained(config.pretrained_model)
+    
+    model = BertBiLSTMCRF(
+        config=bert_config,
+        num_tags=config.num_tags,
+        hidden_dim=config.hidden_dim,
+        num_layers=config.num_layers,
+        dropout=config.dropout
+    )
+    
+    model.to(device)
+    
+    # 优化器
+    no_decay = ['bias', 'LayerNorm.weight']
+    optimizer_grouped_parameters = [
+        {
+            'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            'weight_decay': 0.01
+        },
+        {
+            'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            'weight_decay': 0.0
+        }
+    ]
+    
+    optimizer = AdamW(optimizer_grouped_parameters, lr=config.learning_rate)
+    
+    # 学习率调度器
+    total_steps = len(train_dataloader) * config.num_epochs
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=config.warmup_steps,
+        num_training_steps=total_steps
+    )
+    
+    # 训练循环
+    print("\n" + "=" * 60)
+    print("Starting training...")
+    print("=" * 60)
+    
+    best_f1 = 0.0
+    global_step = 0
+    
+    for epoch in range(config.num_epochs):
+        print(f"\nEpoch {epoch + 1}/{config.num_epochs}")
+        
+        # 训练
         model.train()
-        total_loss = 0.0
-        for batch in train_loader:
+        train_loss = 0.0
+        train_steps = 0
+        
+        progress_bar = tqdm(train_dataloader, desc="Training")
+        for batch in progress_bar:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            token_type_ids = batch['token_type_ids'].to(device)
+            labels = batch['labels'].to(device)
+            
+            # 前向传播
+            loss = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids,
+                labels=labels
+            )
+            
+            # 反向传播
             optimizer.zero_grad()
-            input_ids = batch['input_ids'].to(DEVICE)
-            attention_mask = batch['attention_mask'].to(DEVICE)
-            labels = batch['labels'].to(DEVICE)
-            loss = model(input_ids, attention_mask, labels=labels)
             loss.backward()
+            
+            # 梯度裁剪
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+            
+            # 更新参数
             optimizer.step()
             scheduler.step()
-            total_loss += loss.item()
-        avg_loss = total_loss / max(1, len(train_loader))
-        print(f"Epoch {epoch} loss={avg_loss:.4f}")
-        evaluate(model, dev_loader, {i: l for i, l in enumerate(label_list)})
+            
+            # 统计
+            train_loss += loss.item()
+            train_steps += 1
+            global_step += 1
+            
+            # 更新进度条
+            progress_bar.set_postfix({'loss': f'{loss.item():.4f}'})
+            
+            # 定期打印日志
+            if global_step % config.logging_steps == 0:
+                avg_loss = train_loss / train_steps
+                print(f"\nStep {global_step}, Avg Loss: {avg_loss:.4f}")
+        
+        # 计算平均训练损失
+        avg_train_loss = train_loss / train_steps
+        print(f"\nAverage training loss: {avg_train_loss:.4f}")
+        
+        # 在验证集上评估
+        print("\nEvaluating on dev set...")
+        metrics = evaluate(model, dev_dataloader, device, config.id2tag)
+        
+        print(f"\nDev Metrics:")
+        print(f"  Precision: {metrics['precision']:.4f}")
+        print(f"  Recall: {metrics['recall']:.4f}")
+        print(f"  F1: {metrics['f1']:.4f}")
+        
+        # 保存最佳模型
+        if metrics['f1'] > best_f1:
+            best_f1 = metrics['f1']
+            print(f"\n✓ New best F1: {best_f1:.4f}, saving model...")
+            
+            # 保存模型
+            model_save_path = output_dir / "best_model.pth"
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'best_f1': best_f1,
+                'config': config
+            }, model_save_path)
+            
+            print(f"  Model saved to {model_save_path}")
+    
+    print("\n" + "=" * 60)
+    print("Training completed!")
+    print(f"Best F1 score: {best_f1:.4f}")
+    print("=" * 60)
 
-    save_dir = Path(__file__).parent / 'ner_model'
-    save_dir.mkdir(exist_ok=True)
-    torch.save({'state_dict': model.state_dict(), 'label2id': {l: i for i, l in enumerate(label_list)}}, save_dir / 'model.pt')
-    print(f"模型已保存到 {save_dir}")
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     train()

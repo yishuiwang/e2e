@@ -1,104 +1,125 @@
+"""
+BERT + BiLSTM + CRF 模型定义
+"""
 import torch
 import torch.nn as nn
-from transformers import AutoModel
+from transformers import BertModel, BertPreTrainedModel
+from torchcrf import CRF
 
 
-class CRFLayer(nn.Module):
-    def __init__(self, num_tags: int):
-        super().__init__()
+class BertBiLSTMCRF(BertPreTrainedModel):
+    """
+    BERT + BiLSTM + CRF 模型用于NER任务
+    
+    架构:
+    1. BERT: 提取字符级别的contextualized embeddings
+    2. BiLSTM: 进一步建模序列依赖关系
+    3. CRF: 解码最优标签序列，确保标签转移的合法性
+    """
+    
+    def __init__(self, config, num_tags, hidden_dim=256, num_layers=2, dropout=0.3):
+        """
+        Args:
+            config: BERT配置
+            num_tags: 标签数量
+            hidden_dim: BiLSTM隐藏层维度
+            num_layers: BiLSTM层数
+            dropout: dropout比例
+        """
+        super(BertBiLSTMCRF, self).__init__(config)
+        
         self.num_tags = num_tags
-        self.start_transitions = nn.Parameter(torch.empty(num_tags))
-        self.end_transitions = nn.Parameter(torch.empty(num_tags))
-        self.transitions = nn.Parameter(torch.empty(num_tags, num_tags))
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        nn.init.uniform_(self.start_transitions, -0.1, 0.1)
-        nn.init.uniform_(self.end_transitions, -0.1, 0.1)
-        nn.init.uniform_(self.transitions, -0.1, 0.1)
-
-    def forward(self, emissions, tags, mask):
-        # emissions: [B, T, C]; tags: [B, T]; mask: [B, T]
-        log_den = self._compute_log_partition_function(emissions, mask)
-        log_num = self._compute_gold_score(emissions, tags, mask)
-        return log_num - log_den
-
-    def decode(self, emissions, mask):
-        return self._viterbi_decode(emissions, mask)
-
-    def _compute_gold_score(self, emissions, tags, mask):
-        bsz, seq_len, num_tags = emissions.size()
-        score = self.start_transitions[tags[:, 0]] + emissions[:, 0, :].gather(1, tags[:, 0].unsqueeze(1)).squeeze(1)
-        for t in range(1, seq_len):
-            mask_t = mask[:, t]
-            emit_t = emissions[:, t, :].gather(1, tags[:, t].unsqueeze(1)).squeeze(1)
-            trans_t = self.transitions[tags[:, t - 1], tags[:, t]]
-            score += (emit_t + trans_t) * mask_t
-        last_mask_index = mask.sum(1).long() - 1
-        last_tags = tags.gather(1, last_mask_index.unsqueeze(1)).squeeze(1)
-        score += self.end_transitions[last_tags]
-        return score.sum()
-
-    def _compute_log_partition_function(self, emissions, mask):
-        bsz, seq_len, num_tags = emissions.size()
-        log_alpha = self.start_transitions + emissions[:, 0]
-        for t in range(1, seq_len):
-            emit_t = emissions[:, t]  # [B, C]
-            mask_t = mask[:, t].unsqueeze(1)  # [B,1]
-            score_t = log_alpha.unsqueeze(2) + self.transitions.unsqueeze(0) + emit_t.unsqueeze(1)
-            new_log_alpha = torch.logsumexp(score_t, dim=1)
-            log_alpha = torch.where(mask_t.bool(), new_log_alpha, log_alpha)
-        log_alpha = log_alpha + self.end_transitions
-        return torch.logsumexp(log_alpha, dim=1).sum()
-
-    def _viterbi_decode(self, emissions, mask):
-        bsz, seq_len, num_tags = emissions.size()
-        viterbi = self.start_transitions + emissions[:, 0]  # [B, C]
-        backpointers = []
-        for t in range(1, seq_len):
-            broadcast_viterbi = viterbi.unsqueeze(2)
-            broadcast_trans = self.transitions.unsqueeze(0)
-            score_t = broadcast_viterbi + broadcast_trans
-            best_score, best_path = score_t.max(1)
-            viterbi = best_score + emissions[:, t]
-            mask_t = mask[:, t].unsqueeze(1)
-            backpointers.append(best_path)
-            viterbi = torch.where(mask_t.bool(), viterbi, viterbi)
-        viterbi += self.end_transitions
-        best_last_score, best_last_tag = viterbi.max(1)
-        # backtrack
-        best_paths = []
-        for i in range(bsz):
-            seq_end = int(mask[i].sum().item())
-            bp = backpointers[: seq_end - 1]
-            last = best_last_tag[i].item()
-            path = [last]
-            for bptrs_t in reversed(bp):
-                last = bptrs_t[i][last].item()
-                path.append(last)
-            best_paths.append(list(reversed(path)))
-        return best_paths
-
-
-class BERTBiLSTMCRF(nn.Module):
-    def __init__(self, bert_model: str, num_tags: int, lstm_hidden: int = 256, dropout: float = 0.1):
-        super().__init__()
-        self.bert = AutoModel.from_pretrained(bert_model)
-        self.lstm = nn.LSTM(self.bert.config.hidden_size, lstm_hidden // 2, num_layers=1, batch_first=True, bidirectional=True)
+        self.hidden_dim = hidden_dim
+        
+        # BERT层
+        self.bert = BertModel(config)
+        
+        # Dropout
         self.dropout = nn.Dropout(dropout)
-        self.fc = nn.Linear(lstm_hidden, num_tags)
-        self.crf = CRFLayer(num_tags)
-
-    def forward(self, input_ids, attention_mask, labels=None):
-        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        sequence_output = outputs.last_hidden_state
-        lstm_out, _ = self.lstm(sequence_output)
-        emissions = self.fc(self.dropout(lstm_out))
-        mask = attention_mask.bool()
+        
+        # BiLSTM层
+        self.bilstm = nn.LSTM(
+            input_size=config.hidden_size,  # BERT输出维度 (通常是768)
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if num_layers > 1 else 0
+        )
+        
+        # 全连接层：将BiLSTM输出映射到标签空间
+        self.classifier = nn.Linear(hidden_dim * 2, num_tags)  # *2因为是双向
+        
+        # CRF层
+        self.crf = CRF(num_tags, batch_first=True)
+        
+        # 初始化权重
+        self.init_weights()
+    
+    def forward(self, input_ids, attention_mask=None, token_type_ids=None, 
+                labels=None, seq_len=None):
+        """
+        前向传播
+        
+        Args:
+            input_ids: [batch_size, seq_len]
+            attention_mask: [batch_size, seq_len]
+            token_type_ids: [batch_size, seq_len]
+            labels: [batch_size, seq_len] (可选，训练时需要)
+            seq_len: [batch_size] 实际序列长度 (可选)
+        
+        Returns:
+            如果labels不为None，返回loss
+            否则返回预测的标签序列
+        """
+        # 1. BERT编码
+        bert_outputs = self.bert(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids
+        )
+        
+        # 获取sequence output: [batch_size, seq_len, hidden_size]
+        sequence_output = bert_outputs.last_hidden_state
+        
+        # 2. Dropout
+        sequence_output = self.dropout(sequence_output)
+        
+        # 3. BiLSTM编码
+        # LSTM需要先pack，以忽略padding部分（可选，这里简化处理）
+        lstm_output, _ = self.bilstm(sequence_output)
+        # lstm_output: [batch_size, seq_len, hidden_dim * 2]
+        
+        # 4. 应用dropout
+        lstm_output = self.dropout(lstm_output)
+        
+        # 5. 映射到标签空间
+        emissions = self.classifier(lstm_output)
+        # emissions: [batch_size, seq_len, num_tags]
+        
+        # 6. CRF处理
         if labels is not None:
-            # labels shape [B, T]; mask [B, T]
-            loss = -self.crf(emissions, labels, mask) / input_ids.size(0)
+            # 训练模式：计算负对数似然损失
+            # CRF的mask：1表示真实token，0表示padding
+            mask = attention_mask.bool()
+            
+            # CRF loss (negative log likelihood)
+            loss = -self.crf(emissions, labels, mask=mask, reduction='mean')
             return loss
         else:
-            paths = self.crf.decode(emissions, mask)
-            return paths
+            # 预测模式：使用viterbi算法解码最优路径
+            mask = attention_mask.bool()
+            predictions = self.crf.decode(emissions, mask=mask)
+            return predictions
+    
+    def get_bert_embedding(self, input_ids, attention_mask=None, token_type_ids=None):
+        """
+        获取BERT的embedding（用于分析或可视化）
+        """
+        with torch.no_grad():
+            bert_outputs = self.bert(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids
+            )
+            return bert_outputs.last_hidden_state

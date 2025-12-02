@@ -12,3 +12,21 @@ Schema
 定义schema
 专业、课程、知识点；
 岗位、技能、行业、职责。
+
+
+EduNER: a Chinese named entity recognition dataset for education research
+https://link.springer.com/article/10.1007/s00521-023-08635-5
+### **✔ 提取教育领域文本中的实体**
+中文
+
+* **PER**：作者、教育人物
+* **DAT**：日期
+* **TER**：教育术语、概念
+* **ORG**：学校、机构
+* **LOC**：地点
+* …以及共 **16 种实体类型**
+
+
+https://huggingface.co/datasets/Mehyaar/Annotated_NER_PDF_Resumes/tree/main
+包含5,029个CV样本的NER数据集，手动标注IT技能，从PDF简历中提取。IT技能（skills，如Python、Machine Learning）、职位（role）等。
+英文
