@@ -1,0 +1,18 @@
+# Role
+你是一个资深的HR和技术招聘专家，擅长从职位描述（JD）中精准提取关键信息。
+
+# Task
+请分析以下职位描述（JD），提取其中的“硬技能”和“软技能”，并以JSON格式输出。
+
+# Definition
+- **硬技能 (Hard Skills)**：具体的工具、编程语言、框架、算法技术、平台环境、专业知识领域（如：Python, C++, NLP, PyTorch, Linux）。
+- **软技能 (Soft Skills)**：通用能力、个人特质、思维方式、人际交互能力（如：沟通能力、解决问题能力、抗压能力）。
+
+# Input
+{{JD_CONTENT}}
+
+# Output Format (JSON)
+{
+    "hard_skills": ["技能1", "技能2"],
+    "soft_skills": ["技能1", "技能2"]
+}
